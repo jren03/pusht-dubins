@@ -1,69 +1,74 @@
-"""Push-T integration demo: sys-id, Dubins expected rollout, and drift analysis.
+"""Push-T integration demo: sys-id, Dubins rollout, and environment-metric progress.
 
 This script intentionally excludes DDP and focuses on:
 1) Seeded Push-T reset
 2) Contact probing + system identification (weighted SVD)
 3) Dubins planning from identified contact model
 4) Expected model rollout visualization
-5) Open-loop execution in Push-T to quantify drift
+5) Open-loop execution in Push-T with coverage-based progress evaluation
 """
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Circle, Polygon
+import shapely.geometry as sg
 
 from planar_pushing_tools.config import OptsModel, set_contact_model_b
+from planar_pushing_tools.demo_pusht_sysid_dubins_viz import (
+    MP4Recorder,
+    save_frames_to_mp4,
+    save_start_comparison_image,
+)
 from planar_pushing_tools.model import f_
 from planar_pushing_tools.push_learner import PushLearner
 from planar_pushing_tools.push_planner_dubin import PushPlannerDubin
 
+# ------------------------- Constant Config -------------------------
+# Execution
+SEED = 1
+RESET_TO_STATE = None  # e.g. [agent_x, agent_y, block_x, block_y, block_theta]
+RENDER_MODE = "rgb_array"  # "rgb_array" or "human"
+SHOW_PLOT = False
 
-class MP4Recorder:
-    def __init__(self, enabled: bool):
-        self.enabled = enabled
-        self.frames = []
+# Identification / model
+N_PROBE = 40
+PROBE_ANGLE_DEG = 45.0
+PROBE_MAG = 12.0
+PROBE_DISCOUNT = 0.9
+RHO = 60.0  # Value in pixel space
+# Same weighted-SVD logic as demo_planars.py, but with a shorter rolling window
+# to allow multiple accepted updates during a longer probing phase in Push-T.
+LEARNER_WINDOW = 10
 
-    def capture(self, env):
-        if not self.enabled:
-            return
-        frame = env.render()
-        if frame is None:
-            raise RuntimeError("Failed to capture frame: env.render() returned None.")
-        frame = np.asarray(frame)
-        if frame.ndim != 3 or frame.shape[2] != 3:
-            raise RuntimeError(
-                f"Unexpected frame shape from env.render(): {frame.shape}"
-            )
-        self.frames.append(frame.copy())
+# Same role as `pt` in demo_planars.py, but for Push-T's finite-radius pusher:
+# center of pusher when contacting the left side of the T crossbar.
+# Contact point is half width on the top bar of T:
+# Half width: 60 + pusher radius: 15 => 60+15=75
+PT_LOCAL = np.array([-75.0, 0.0], dtype=float)
 
-    def save(self, output_path: str, fps: float):
-        if not self.enabled:
-            return
-        if len(self.frames) == 0:
-            print("No frames captured; skipping MP4 save.")
-            return
+MU = 0.2
 
-        try:
-            from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
-        except ImportError as exc:
-            raise ImportError(
-                "moviepy is required for MP4 export via ImageSequenceClip. "
-                "Install with: pip install moviepy"
-            ) from exc
+# Rollout horizon
+MAX_ROLLOUT_STEPS = 0  # <=0 means full Dubins plan
+# Avoid over-dense Dubins samples when radius_turn is small; in Push-T this can
+# produce tiny target updates and negligible object motion in open loop.
+MIN_DUBINS_STEP_SIZE = 0.75
 
-        clip = ImageSequenceClip(self.frames, fps=fps)
-        clip.write_videofile(output_path, codec="libx264", audio=False, logger=None)
-        clip.close()
-        print(f"Saved MP4 to {output_path} ({len(self.frames)} frames @ {fps:.2f} fps)")
+# Outputs (saved to current working directory)
+SAVE_PLOT = True
+SAVE_ROLLOUT_MP4 = True
+SAVE_DEBUG_LOG = True
+OUTPUT_PLOT_PATH = "pusht_start_comparison.png"
+OUTPUT_ROLLOUT_MP4_PATH = "pusht_rollout.mp4"
+OUTPUT_DEBUG_LOG_PATH = "pusht_rollout_debug.txt"
+OUTPUT_FPS = None  # None -> use env render_fps
 
 
-def _ensure_gym_pusht_importable():
+def ensure_gym_pusht_importable():
     repo_root = Path(__file__).resolve().parent
     local_pkg = repo_root / "gym-pusht"
     if str(local_pkg) not in sys.path:
@@ -72,6 +77,10 @@ def _ensure_gym_pusht_importable():
 
 def wrap_to_pi(angle: np.ndarray | float):
     return (np.asarray(angle) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def unwrap_angle_near_reference(target_angle: float, reference_angle: float) -> float:
+    return float(reference_angle + wrap_to_pi(target_angle - reference_angle))
 
 
 def rot2(theta: float) -> np.ndarray:
@@ -124,24 +133,26 @@ def contact_target_from_local(
     return block_pose[:2] + rot2(block_pose[2]) @ (pt_local + local_offset)
 
 
-def run_contact_alignment(
+def place_pusher_at_local_contact_without_step(
     env,
     info: dict,
     pt_local: np.ndarray,
-    n_steps: int,
-    inward_offset: float,
     recorder: MP4Recorder | None = None,
 ):
+    """Project hidden pusher state onto nominal local contact without moving the block."""
     block_pose = block_pose_from_info(info)
-    local_offset = np.array([inward_offset, 0.0], dtype=float)
-    for _ in range(n_steps):
-        action = contact_target_from_local(block_pose, pt_local, local_offset)
-        _, _, terminated, truncated, info = env.step(clip_action(action))
-        if recorder is not None:
-            recorder.capture(env)
-        block_pose = block_pose_from_info(info)
-        if terminated or truncated:
-            break
+    pusher_xy = clip_action(
+        contact_target_from_local(
+            block_pose, pt_local, local_offset=np.array([0.0, 0.0], dtype=float)
+        )
+    )
+    env.unwrapped.agent.position = tuple(pusher_xy.tolist())
+    env.unwrapped.agent.velocity = (0.0, 0.0)
+    info = dict(info)
+    info["pos_agent"] = pusher_xy.copy()
+    info["vel_agent"] = np.zeros(2, dtype=float)
+    if recorder is not None:
+        recorder.capture(env)
     return info
 
 
@@ -151,6 +162,7 @@ def run_sysid_probing(
     learner: PushLearner,
     opts_model: OptsModel,
     args,
+    pt_action_local: np.ndarray,
     recorder: MP4Recorder | None = None,
 ):
     """Run alternating local pushes and fit contact model b via SVD."""
@@ -170,7 +182,7 @@ def run_sysid_probing(
             ],
             dtype=float,
         )
-        action = contact_target_from_local(block_pose, opts_model.pt, local_offset)
+        action = contact_target_from_local(block_pose, pt_action_local, local_offset)
         _, _, terminated, truncated, info_next = env.step(clip_action(action))
         if recorder is not None:
             recorder.capture(env)
@@ -196,13 +208,18 @@ def rollout_model_with_local_displacements(
     T: float,
     D_inv: np.ndarray,
 ):
-    """Roll out planar model f_ with local displacement controls."""
+    """Roll out planar model f_ with local displacement controls.
+
+    PushPlannerDubin returns per-step local displacements. The dynamics model f_
+    expects a speed-like magnitude that is multiplied by T internally, so we
+    convert displacement -> speed with mag = ||u_local|| / T.
+    """
     n = u_local.shape[1] + 1
     x = np.zeros((3, n), dtype=float)
     x[:, 0] = x_start
     for i in range(n - 1):
         u_i = u_local[:, i]
-        mag = float(np.linalg.norm(u_i))
+        mag = float(np.linalg.norm(u_i) / max(float(T), 1e-12))
         ang = float(np.arctan2(u_i[1], u_i[0]))
         x[:, i + 1] = f_(x[:, i], np.array([ang, mag], dtype=float), T, D_inv)
     return x
@@ -220,6 +237,7 @@ def execute_open_loop_pusher_targets(
     env,
     info: dict,
     pusher_targets: np.ndarray,
+    goal_pose: np.ndarray,
     recorder: MP4Recorder | None = None,
 ):
     """Execute absolute pusher targets in Push-T and collect true trajectories."""
@@ -227,9 +245,15 @@ def execute_open_loop_pusher_targets(
     x_true = np.zeros((3, n), dtype=float)
     p_true = np.zeros((2, n), dtype=float)
     a_env_exec = np.zeros((2, max(0, n - 1)), dtype=float)
+    coverage_true = np.zeros(n, dtype=float)
+    success_true = np.zeros(n, dtype=bool)
 
     x_true[:, 0] = block_pose_from_info(info)
     p_true[:, 0] = agent_pos_from_info(info)
+    goal_geom = tee_geometry_world(goal_pose)
+    coverage_true[0] = coverage_from_pose(x_true[:, 0], goal_pose, goal_geom=goal_geom)
+    success_threshold = float(env.unwrapped.success_threshold)
+    success_true[0] = coverage_true[0] > success_threshold
 
     end_idx = n - 1
     for i in range(n - 1):
@@ -240,11 +264,27 @@ def execute_open_loop_pusher_targets(
             recorder.capture(env)
         x_true[:, i + 1] = block_pose_from_info(info)
         p_true[:, i + 1] = agent_pos_from_info(info)
+        coverage_i = info.get("coverage", None)
+        if coverage_i is None:
+            coverage_i = coverage_from_pose(
+                x_true[:, i + 1], goal_pose, goal_geom=goal_geom
+            )
+        coverage_true[i + 1] = float(coverage_i)
+        success_true[i + 1] = bool(
+            info.get("is_success", coverage_true[i + 1] > success_threshold)
+        )
         if terminated or truncated:
             end_idx = i + 1
             break
 
-    return x_true[:, : end_idx + 1], p_true[:, : end_idx + 1], a_env_exec[:, :end_idx], info
+    return (
+        x_true[:, : end_idx + 1],
+        p_true[:, : end_idx + 1],
+        a_env_exec[:, :end_idx],
+        coverage_true[: end_idx + 1],
+        success_true[: end_idx + 1],
+        info,
+    )
 
 
 def tee_polygons_world(pose: np.ndarray):
@@ -252,10 +292,10 @@ def tee_polygons_world(pose: np.ndarray):
     # Geometry from gym_pusht.envs.pusht.PushTEnv.add_tee with scale=30.
     shape1 = np.array(
         [
-            [-60.0, 30.0],
-            [60.0, 30.0],
-            [60.0, 0.0],
             [-60.0, 0.0],
+            [60.0, 0.0],
+            [60.0, 30.0],
+            [-60.0, 30.0],
         ],
         dtype=float,
     )
@@ -268,107 +308,35 @@ def tee_polygons_world(pose: np.ndarray):
         ],
         dtype=float,
     )
-    cog = np.array([0.0, 45.0], dtype=float)
     R = rot2(float(pose[2]))
     p = np.asarray(pose[:2], dtype=float)
-    poly1 = (R @ (shape1 - cog).T).T + p
-    poly2 = (R @ (shape2 - cog).T).T + p
+    poly1 = (R @ shape1.T).T + p
+    poly2 = (R @ shape2.T).T + p
     return poly1, poly2
 
 
-def draw_rollout_panel(
-    ax,
-    x_block: np.ndarray,
-    p_pusher: np.ndarray,
-    goal_pose: np.ndarray,
-    title: str,
-    block_color: str,
-    pusher_color: str,
-):
-    ax.plot(x_block[0, :], x_block[1, :], color=block_color, linewidth=2.0, label="Block")
-    ax.plot(p_pusher[0, :], p_pusher[1, :], "--", color=pusher_color, linewidth=1.8, label="Pusher")
-
-    start_poly1, start_poly2 = tee_polygons_world(x_block[:, 0])
-    goal_poly1, goal_poly2 = tee_polygons_world(goal_pose)
-    final_poly1, final_poly2 = tee_polygons_world(x_block[:, -1])
-    ax.add_patch(Polygon(start_poly1, closed=True, fill=False, edgecolor="navy", linewidth=1.4))
-    ax.add_patch(Polygon(start_poly2, closed=True, fill=False, edgecolor="navy", linewidth=1.4))
-    ax.add_patch(Polygon(goal_poly1, closed=True, fill=False, edgecolor="green", linewidth=2.0))
-    ax.add_patch(Polygon(goal_poly2, closed=True, fill=False, edgecolor="green", linewidth=2.0))
-    ax.add_patch(Polygon(final_poly1, closed=True, fill=False, edgecolor=block_color, linewidth=1.6))
-    ax.add_patch(Polygon(final_poly2, closed=True, fill=False, edgecolor=block_color, linewidth=1.6))
-
-    ax.add_patch(Circle(p_pusher[:, 0], radius=15.0, fill=False, edgecolor=pusher_color, linewidth=1.2))
-    ax.plot(goal_pose[0], goal_pose[1], "g*", markersize=10, label="Goal center")
-
-    ax.set_title(title)
-    ax.set_xlabel("x (px)")
-    ax.set_ylabel("y (px)")
-    ax.set_xlim(0, 512)
-    ax.set_ylim(0, 512)
-    ax.set_aspect("equal")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best")
+def tee_geometry_world(pose: np.ndarray):
+    poly1, poly2 = tee_polygons_world(pose)
+    return sg.Polygon(poly1).union(sg.Polygon(poly2))
 
 
-def plot_results(
-    x_expected: np.ndarray,
-    p_expected: np.ndarray,
-    x_true: np.ndarray,
-    p_true: np.ndarray,
-    goal_pose: np.ndarray,
-    save_path: str | None,
-    show_plot: bool,
-):
-    n = min(x_expected.shape[1], x_true.shape[1])
-    x_expected = x_expected[:, :n]
-    p_expected = p_expected[:, :n]
-    x_true = x_true[:, :n]
-    p_true = p_true[:, :n]
+def coverage_from_pose(block_pose: np.ndarray, goal_pose: np.ndarray, goal_geom=None):
+    if goal_geom is None:
+        goal_geom = tee_geometry_world(goal_pose)
+    block_geom = tee_geometry_world(block_pose)
+    goal_area = float(goal_geom.area)
+    if goal_area <= 0.0:
+        return 0.0
+    return float(goal_geom.intersection(block_geom).area / goal_area)
 
-    pos_err = np.linalg.norm(x_true[:2, :] - x_expected[:2, :], axis=0)
-    ang_err = np.abs(wrap_to_pi(x_true[2, :] - x_expected[2, :]))
-    pusher_err = np.linalg.norm(p_true - p_expected, axis=0)
 
-    fig, (ax_exp, ax_env, ax_err) = plt.subplots(1, 3, figsize=(19, 6.2), num=0)
-    draw_rollout_panel(
-        ax=ax_exp,
-        x_block=x_expected,
-        p_pusher=p_expected,
-        goal_pose=goal_pose,
-        title="Anticipated rollout (model)",
-        block_color="tab:blue",
-        pusher_color="tab:cyan",
-    )
-    draw_rollout_panel(
-        ax=ax_env,
-        x_block=x_true,
-        p_pusher=p_true,
-        goal_pose=goal_pose,
-        title="Actual rollout (Push-T env)",
-        block_color="tab:red",
-        pusher_color="tab:pink",
-    )
-
-    # Drift
-    t = np.arange(n)
-    ax_err.plot(t, pos_err, "-r", label="Block position drift (px)")
-    ax_err.plot(t, ang_err, "-b", label="Block angle drift (rad)")
-    ax_err.plot(t, pusher_err, "-m", label="Pusher tracking drift (px)")
-    ax_err.set_title("Drift over rollout")
-    ax_err.set_xlabel("step")
-    ax_err.set_ylabel("error")
-    ax_err.grid(True, alpha=0.3)
-    ax_err.legend(loc="best")
-
-    fig.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Saved plot to {save_path}")
-    if show_plot:
-        plt.show()
-    else:
-        plt.close(fig)
+def coverage_from_traj(x_block_traj: np.ndarray, goal_pose: np.ndarray):
+    n = x_block_traj.shape[1]
+    cov = np.zeros(n, dtype=float)
+    goal_geom = tee_geometry_world(goal_pose)
+    for i in range(n):
+        cov[i] = coverage_from_pose(x_block_traj[:, i], goal_pose, goal_geom=goal_geom)
+    return cov
 
 
 def write_rollout_debug_log(
@@ -378,10 +346,20 @@ def write_rollout_debug_log(
     u_plan_local: np.ndarray,
     x_true: np.ndarray,
     p_true: np.ndarray,
+    p_contact_true_assumed: np.ndarray,
     a_env_exec: np.ndarray,
+    coverage_expected: np.ndarray,
+    coverage_true: np.ndarray,
+    success_threshold: float,
+    goal_pose: np.ndarray,
     T: float,
 ):
-    n = min(x_expected.shape[1], x_true.shape[1])
+    n = min(
+        x_expected.shape[1],
+        x_true.shape[1],
+        coverage_expected.shape[0],
+        coverage_true.shape[0],
+    )
     pos_err = np.linalg.norm(x_true[:2, :n] - x_expected[:2, :n], axis=0)
     ang_err = np.abs(wrap_to_pi(x_true[2, :n] - x_expected[2, :n]))
     pusher_err = np.linalg.norm(p_true[:, :n] - p_expected[:, :n], axis=0)
@@ -393,11 +371,17 @@ def write_rollout_debug_log(
         f.write("# Push-T sys-id Dubins debug log\n")
         f.write(f"# steps={n} dt={T:.6f}\n")
         f.write(
+            f"# goal_pose={goal_pose[0]:.6f},{goal_pose[1]:.6f},{goal_pose[2]:.6f}\n"
+        )
+        f.write(
             "# columns: step | "
-            "x_exp y_exp th_exp | p_exp_x p_exp_y | "
+            "x_plan y_plan th_plan | p_plan_x p_plan_y | "
             "u_plan_local_x u_plan_local_y u_plan_ang u_plan_mag | "
             "u_env_cmd_x u_env_cmd_y | "
             "x_true y_true th_true | p_true_x p_true_y | "
+            "p_contact_true_x p_contact_true_y | "
+            "coverage_exp coverage_true success_threshold success_true | "
+            "dist_goal_exp dist_goal_true goal_ang_err_exp goal_ang_err_true | "
             "err_pos err_ang err_pusher\n"
         )
         for i in range(n):
@@ -433,6 +417,16 @@ def write_rollout_debug_log(
                 x_true[2, i],
                 p_true[0, i],
                 p_true[1, i],
+                p_contact_true_assumed[0, i],
+                p_contact_true_assumed[1, i],
+                coverage_expected[i],
+                coverage_true[i],
+                success_threshold,
+                1.0 if coverage_true[i] > success_threshold else 0.0,
+                np.linalg.norm(x_expected[:2, i] - goal_pose[:2]),
+                np.linalg.norm(x_true[:2, i] - goal_pose[:2]),
+                np.abs(wrap_to_pi(x_expected[2, i] - goal_pose[2])),
+                np.abs(wrap_to_pi(x_true[2, i] - goal_pose[2])),
                 pos_err[i],
                 ang_err[i],
                 pusher_err[i],
@@ -442,131 +436,44 @@ def write_rollout_debug_log(
     print(f"Saved rollout debug table to {log_path}")
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--seed", type=int, default=0, help="Seed used in env.reset(seed=...)."
+def get_config():
+    return SimpleNamespace(
+        seed=SEED,
+        reset_to_state=RESET_TO_STATE,
+        n_probe=N_PROBE,
+        probe_angle_deg=PROBE_ANGLE_DEG,
+        probe_mag=PROBE_MAG,
+        probe_discount=PROBE_DISCOUNT,
+        learner_window=LEARNER_WINDOW,
+        rho=RHO,
+        pt_local=PT_LOCAL.copy(),
+        mu=MU,
+        max_rollout_steps=MAX_ROLLOUT_STEPS,
+        min_dubins_step_size=MIN_DUBINS_STEP_SIZE,
+        render_mode=RENDER_MODE,
+        save_plot=OUTPUT_PLOT_PATH if SAVE_PLOT else "",
+        save_mp4=OUTPUT_ROLLOUT_MP4_PATH if SAVE_ROLLOUT_MP4 else "",
+        mp4_fps=OUTPUT_FPS,
+        debug_log=OUTPUT_DEBUG_LOG_PATH if SAVE_DEBUG_LOG else "",
     )
-    parser.add_argument(
-        "--reset-to-state",
-        type=float,
-        nargs=5,
-        default=None,
-        metavar=("AGENT_X", "AGENT_Y", "BLOCK_X", "BLOCK_Y", "BLOCK_THETA"),
-        help="Optional explicit Push-T reset state.",
-    )
-    parser.add_argument(
-        "--n-probe", type=int, default=10, help="Number of probing pushes for sys-id."
-    )
-    parser.add_argument(
-        "--probe-angle-deg",
-        type=float,
-        default=20.0,
-        help="Alternating probe angle magnitude.",
-    )
-    parser.add_argument(
-        "--probe-mag",
-        type=float,
-        default=8.0,
-        help="Probe displacement magnitude in px.",
-    )
-    parser.add_argument(
-        "--probe-discount", type=float, default=0.9, help="SVD data discount factor."
-    )
-    parser.add_argument(
-        "--rho",
-        type=float,
-        default=60.0,
-        help="Characteristic length rho for contact model.",
-    )
-    parser.add_argument(
-        "--contact-radius",
-        type=float,
-        default=75.0,
-        help="Distance from block COM to nominal pusher contact point (px).",
-    )
-    parser.add_argument(
-        "--align-steps",
-        type=int,
-        default=20,
-        help="Steps to align pusher to contact before/after probe.",
-    )
-    parser.add_argument(
-        "--align-inward-offset",
-        type=float,
-        default=2.0,
-        help="Extra local +x offset during alignment to keep light preload.",
-    )
-    parser.add_argument(
-        "--mu",
-        type=float,
-        default=0.3,
-        help="Friction coefficient used by Dubins model.",
-    )
-    parser.add_argument(
-        "--max-rollout-steps",
-        type=int,
-        default=160,
-        help="Maximum number of planned steps executed in environment.",
-    )
-    parser.add_argument(
-        "--render-mode",
-        type=str,
-        default="rgb_array",
-        choices=["rgb_array", "human"],
-        help="Push-T render mode.",
-    )
-    parser.add_argument(
-        "--save-plot",
-        type=str,
-        default="pusht_sysid_dubins_rollout.png",
-        help="Path to save matplotlib visualization. Use empty string to disable.",
-    )
-    parser.add_argument(
-        "--save-mp4",
-        type=str,
-        default="pusht_sysid_dubins_rollout.mp4",
-        help="Path to save headless rollout video via ImageSequenceClip. Use empty string to disable.",
-    )
-    parser.add_argument(
-        "--mp4-fps",
-        type=float,
-        default=None,
-        help="FPS for saved MP4. Default: env render_fps.",
-    )
-    parser.add_argument(
-        "--debug-log",
-        type=str,
-        default="pusht_sysid_dubins_rollout_debug.txt",
-        help="Path to save per-step anticipated vs actual state/action table. Use empty string to disable.",
-    )
-    parser.add_argument(
-        "--no-show",
-        action="store_true",
-        help="Do not open matplotlib window (useful for headless runs).",
-    )
-    return parser
 
 
 def main():
-    args = build_parser().parse_args()
-    _ensure_gym_pusht_importable()
-    try:
-        import gymnasium as gym
-        import gym_pusht  # noqa: F401
-    except ImportError as exc:
-        raise ImportError(
-            "Failed to import gymnasium/gym_pusht. Install local gym-pusht dependencies first."
-        ) from exc
+    args = get_config()
+    ensure_gym_pusht_importable()
+    import gym_pusht  # noqa: F401
+    import gymnasium as gym
 
     np.random.seed(args.seed)
 
-    render_mode = "rgb_array" if args.save_mp4 else args.render_mode
-    if args.save_mp4 and args.render_mode != "rgb_array":
+    # Start-comparison plotting also needs captured rollout frames.
+    need_frame_capture = bool(args.save_mp4 or args.save_plot)
+    render_mode = "rgb_array" if need_frame_capture else args.render_mode
+    if need_frame_capture and args.render_mode != "rgb_array":
         print("Overriding render mode to rgb_array for headless MP4 recording.")
     env = gym.make("gym_pusht/PushT-v0", obs_type="state", render_mode=render_mode)
     try:
-        recorder = MP4Recorder(enabled=bool(args.save_mp4))
+        recorder = MP4Recorder(enabled=need_frame_capture)
         reset_options = None
         if args.reset_to_state is not None:
             reset_options = {
@@ -581,9 +488,15 @@ def main():
         print(f"Initial block pose: {block_pose_from_info(info)}")
         print(f"Goal block pose   : {goal_pose}")
         print(f"Model timestep T={T:.4f}s")
+        print(
+            "State space used for planning: privileged low-dimensional [x, y, theta] from env info."
+        )
+        print(
+            f"Evaluation metric: Push-T coverage (success threshold={env.unwrapped.success_threshold:.2f})."
+        )
 
-        # Contact model setup (left-side nominal contact in local frame).
-        pt_local = np.array([-args.contact_radius, 0.0], dtype=float)
+        # Contact model setup (same local point in both frames; only world frame rotates).
+        pt_local = np.asarray(args.pt_local, dtype=float).copy()
         opts_model = OptsModel()
         opts_model.T = T
         opts_model.rho = float(args.rho)
@@ -595,20 +508,29 @@ def main():
         b0 = opts_model.c / np.linalg.norm(opts_model.c)
         set_contact_model_b(opts_model, b0)
 
-        # Bring pusher near nominal contact before probing.
-        info = run_contact_alignment(
-            env,
-            info,
-            pt_local,
-            args.align_steps,
-            args.align_inward_offset,
-            recorder=recorder,
+        # Match demo_planars assumption: start each phase with pusher at nominal contact.
+        info = place_pusher_at_local_contact_without_step(
+            env, info, pt_local, recorder=recorder
         )
 
         # Probing + sys-id (no DDP).
-        learner = PushLearner(args.n_probe, args.probe_discount, opts_model)
+        learner_window = int(args.learner_window)
+        if learner_window <= 0:
+            learner_window = int(args.n_probe)
+        learner_window = max(3, min(learner_window, int(args.n_probe)))
+        print(
+            f"Probing setup (demo_planars-style alternating pushes): "
+            f"n_probe={args.n_probe}, learner_window={learner_window}"
+        )
+        learner = PushLearner(learner_window, args.probe_discount, opts_model)
         b_est, flag_last, accepted, info = run_sysid_probing(
-            env, info, learner, opts_model, args, recorder=recorder
+            env,
+            info,
+            learner,
+            opts_model,
+            args,
+            pt_action_local=pt_local,
+            recorder=recorder,
         )
         if flag_last < 0:
             print(
@@ -620,17 +542,13 @@ def main():
         print(f"Estimated b: {b_est}")
         print(f"Accepted SVD updates: {accepted}/{args.n_probe}")
 
-        # Re-align pusher at contact and freeze start pose for planning/rollout.
-        info = run_contact_alignment(
-            env,
-            info,
-            pt_local,
-            args.align_steps,
-            args.align_inward_offset,
-            recorder=recorder,
-        )
         x_start = block_pose_from_info(info)
-        print(f"Planning start block pose: {x_start}")
+        info = place_pusher_at_local_contact_without_step(
+            env, info, pt_local, recorder=recorder
+        )
+        print(f"Planning start block pose (env): {x_start}")
+        coverage_start = coverage_from_pose(x_start, goal_pose)
+        print(f"Coverage at planning start: {coverage_start:.4f}")
 
         # Dubins from identified model.
         a_ls, b_ls = estimate_dubins_limit_surface_from_b(
@@ -641,26 +559,81 @@ def main():
             f"Dubins LS (from sys-id): a={a_ls:.6f}, b={b_ls:.6f}, radius={dubins.radius_turn:.4f}"
         )
 
-        _, u_plan_local = dubins.plan(x_start, goal_pose)
-        x_expected = rollout_model_with_local_displacements(
+        # Plan to the environment goal pose, using the nearest equivalent yaw branch
+        # to avoid unnecessary 2*pi turns in Dubins heading.
+        goal_pose_plan = goal_pose.copy()
+        goal_pose_plan[2] = unwrap_angle_near_reference(
+            float(goal_pose_plan[2]), float(x_start[2])
+        )
+        print(
+            f"Dubins planning target pose: [{goal_pose_plan[0]:.3f}, {goal_pose_plan[1]:.3f}, {goal_pose_plan[2]:.3f}] "
+            f"(env goal yaw={goal_pose[2]:.3f})"
+        )
+
+        dubins_step_size = max(
+            float(dubins.radius_turn / 50.0), float(args.min_dubins_step_size)
+        )
+        print(f"Dubins sampling step size: {dubins_step_size:.4f}px")
+        x_dubins, u_plan_local = dubins.plan(
+            x_start, goal_pose_plan, step_size=dubins_step_size
+        )
+        p_dubins = pusher_path_from_block_traj(x_dubins, pt_local)
+        x_model_roll = rollout_model_with_local_displacements(
             x_start, u_plan_local, T, opts_model.D_inv
         )
-        p_expected = pusher_path_from_block_traj(x_expected, pt_local)
+        d_goal_start = float(np.linalg.norm(x_dubins[:2, 0] - goal_pose[:2]))
+        plan_goal_pos_err = float(np.linalg.norm(x_dubins[:2, -1] - goal_pose[:2]))
+        plan_goal_ang_err = float(np.abs(wrap_to_pi(x_dubins[2, -1] - goal_pose[2])))
+        model_goal_pos_err = float(np.linalg.norm(x_model_roll[:2, -1] - goal_pose[:2]))
+        model_goal_ang_err = float(
+            np.abs(wrap_to_pi(x_model_roll[2, -1] - goal_pose[2]))
+        )
+        print(
+            f"Dubins planned distance-to-goal: start={d_goal_start:.4f}px, end={plan_goal_pos_err:.4f}px"
+        )
+        print(
+            f"Dubins planned final-goal error: pos={plan_goal_pos_err:.4f}px, "
+            f"ang={plan_goal_ang_err:.4f}rad"
+        )
+        print(
+            f"Model roll-forward final-goal error (same actions): pos={model_goal_pos_err:.4f}px, "
+            f"ang={model_goal_ang_err:.4f}rad"
+        )
+        if plan_goal_pos_err > 1e-3 or plan_goal_ang_err > 1e-3:
+            print(
+                "[WARNING] Dubins plan did not terminate exactly at requested goal pose. "
+                f"pos_err={plan_goal_pos_err:.6f}, ang_err={plan_goal_ang_err:.6f}"
+            )
 
         # Execute absolute pusher targets open-loop in Push-T.
-        n_exec = min(args.max_rollout_steps + 1, p_expected.shape[1])
-        x_true, p_true, a_env_exec, _ = execute_open_loop_pusher_targets(
-            env, info, p_expected[:, :n_exec], recorder=recorder
+        if args.max_rollout_steps <= 0:
+            n_exec = p_dubins.shape[1]
+        else:
+            n_exec = min(args.max_rollout_steps + 1, p_dubins.shape[1])
+        rollout_frame_start = len(recorder.frames)
+        if recorder.enabled:
+            recorder.capture(env)  # rollout frame at step 0
+        x_true, p_true, a_env_exec, coverage_true, success_true, _ = (
+            execute_open_loop_pusher_targets(
+                env, info, p_dubins[:, :n_exec], goal_pose=goal_pose, recorder=recorder
+            )
         )
-        x_expected_exec = x_expected[:, :n_exec]
-        p_expected_exec = p_expected[:, :n_exec]
+        x_expected_exec = x_dubins[:, :n_exec]
+        p_expected_exec = p_dubins[:, :n_exec]
+        coverage_expected = coverage_from_traj(x_expected_exec, goal_pose)
         u_plan_local_exec = u_plan_local[:, : max(0, n_exec - 1)]
+        p_contact_true_assumed = pusher_path_from_block_traj(x_true, pt_local)
 
         # Align lengths for drift metrics.
         n = min(x_expected_exec.shape[1], x_true.shape[1])
         pos_err = np.linalg.norm(x_true[:2, :n] - x_expected_exec[:2, :n], axis=0)
         ang_err = np.abs(wrap_to_pi(x_true[2, :n] - x_expected_exec[2, :n]))
         pusher_err = np.linalg.norm(p_true[:, :n] - p_expected_exec[:, :n], axis=0)
+        coverage_expected_exec = coverage_expected[:n]
+        coverage_true_exec = coverage_true[:n]
+        success_true_exec = success_true[:n]
+        success_threshold = float(env.unwrapped.success_threshold)
+        d_goal_true = np.linalg.norm(x_true[:2, :n] - goal_pose[:2, None], axis=0)
 
         print("Drift summary:")
         print(f"  rollout steps                 : {n - 1}")
@@ -669,17 +642,36 @@ def main():
         print(f"  mean block angle drift (rad)  : {float(np.mean(ang_err)):.4f}")
         print(f"  final block angle drift (rad) : {float(ang_err[-1]):.4f}")
         print(f"  mean pusher tracking drift(px): {float(np.mean(pusher_err)):.3f}")
-
-        save_path = args.save_plot if args.save_plot else None
-        plot_results(
-            x_expected=x_expected_exec,
-            p_expected=p_expected_exec,
-            x_true=x_true,
-            p_true=p_true,
-            goal_pose=goal_pose,
-            save_path=save_path,
-            show_plot=not args.no_show,
+        print(
+            "  note: pusher tracking drift = ||actual pusher position - planner contact point||"
         )
+        print("Coverage summary (environment metric):")
+        print(f"  start coverage                : {float(coverage_true_exec[0]):.4f}")
+        print(
+            f"  max coverage                  : {float(np.max(coverage_true_exec)):.4f}"
+        )
+        print(f"  final coverage                : {float(coverage_true_exec[-1]):.4f}")
+        print(f"  success threshold             : {success_threshold:.4f}")
+        print(f"  any success during rollout    : {bool(np.any(success_true_exec))}")
+        print(
+            f"  coverage progress (final-start): "
+            f"{float(coverage_true_exec[-1] - coverage_true_exec[0]):+.4f}"
+        )
+        print("Goal-center distance (diagnostic only):")
+        print(
+            f"  start / min / final (px)      : {float(d_goal_true[0]):.3f} / {float(np.min(d_goal_true)):.3f} / {float(d_goal_true[-1]):.3f}"
+        )
+
+        if args.save_plot:
+            pusht_start_frame = recorder.frames[rollout_frame_start]
+            save_start_comparison_image(
+                pusht_start_frame_rgb=pusht_start_frame,
+                x_traj=x_expected_exec,
+                p_pusher_traj=p_expected_exec,
+                goal_pose=goal_pose,
+                get_tee_polygons=tee_polygons_world,
+                save_path=args.save_plot,
+            )
         if args.debug_log:
             write_rollout_debug_log(
                 log_path=args.debug_log,
@@ -688,7 +680,12 @@ def main():
                 u_plan_local=u_plan_local_exec,
                 x_true=x_true,
                 p_true=p_true,
+                p_contact_true_assumed=p_contact_true_assumed,
                 a_env_exec=a_env_exec,
+                coverage_expected=coverage_expected_exec,
+                coverage_true=coverage_true_exec,
+                success_threshold=success_threshold,
+                goal_pose=goal_pose,
                 T=T,
             )
         if args.save_mp4:
@@ -697,7 +694,10 @@ def main():
                 if args.mp4_fps is not None
                 else float(env.unwrapped.metadata["render_fps"])
             )
-            recorder.save(args.save_mp4, mp4_fps)
+            rollout_frames = recorder.frames[
+                rollout_frame_start : rollout_frame_start + x_true.shape[1]
+            ]
+            save_frames_to_mp4(rollout_frames, args.save_mp4, mp4_fps)
     finally:
         env.close()
 

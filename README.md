@@ -50,12 +50,27 @@ Full closed-loop pushing controller with online model learning and replanning un
 python demo_online_learning_replanning.py
 ```
 
+### demo_pusht_sysid_dubins.py
+
+Push-T open-loop Dubins rollout with contact-model identification in privileged low-dimensional state.
+
+**Environment-metric note:**
+- Planning and system ID use Push-T privileged state (`block_pose` / `agent_pos`) from `info`, not pixels.
+- Evaluation is aligned to Push-T success: **coverage** (same metric used in `PushTEnv.step()`), with threshold `0.95`.
+- Goal-center distance is logged as a diagnostic only; coverage is the primary progress/success metric.
+- Dubins sampling uses a minimum step size so open-loop pusher commands are not too fine-grained to move the block.
+
+```bash
+python demo_pusht_sysid_dubins.py
+```
+
 ## File Structure
 
 ```
 planar_pushing_tools/
 ├── demo_planars.py                 # Compare DDP vs Dubins planners
 ├── demo_online_learning_replanning.py  # Online learning + replanning demo
+├── demo_pusht_sysid_dubins.py      # Push-T sys-id + open-loop Dubins rollout
 ├── requirements.txt
 ├── README.md
 └── planar_pushing_tools/           # Main package
