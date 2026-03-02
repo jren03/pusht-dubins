@@ -29,7 +29,7 @@ from planar_pushing_tools.push_planner_dubin import PushPlannerDubin
 
 # ------------------------- Constant Config -------------------------
 # Execution
-SEED = 1
+SEED = 2
 RESET_TO_STATE = None  # e.g. [agent_x, agent_y, block_x, block_y, block_theta]
 RENDER_MODE = "rgb_array"  # "rgb_array" or "human"
 SHOW_PLOT = False
@@ -42,21 +42,27 @@ PROBE_DISCOUNT = 0.9
 RHO = 60.0  # Value in pixel space
 # Same weighted-SVD logic as demo_planars.py, but with a shorter rolling window
 # to allow multiple accepted updates during a longer probing phase in Push-T.
-LEARNER_WINDOW = 10
+LEARNER_WINDOW = 12
 
-# Same role as `pt` in demo_planars.py, but for Push-T's finite-radius pusher:
-# center of pusher when contacting the left side of the T crossbar.
-# Contact point is half width on the top bar of T:
-# Half width: 60 + pusher radius: 15 => 60+15=75
-PT_LOCAL = np.array([-75.0, 0.0], dtype=float)
+# Best triage contact point (~0.56 max coverage in full-horizon sweeps):
+# left-side contact near the upper crossbar region.
+PT_LOCAL = np.array([-75.0, 25.0], dtype=float)
 
 MU = 0.2
+
+# Optional contact-point search before final rollout visualization.
+# If enabled, evaluate side contact points (excluding corners) and pick the
+# shortest planned frame-count candidate, then run/save that chosen case.
+SEARCH_CONTACT_POINTS = True
+CONTACT_POINTS_PER_SIDE = 7
+CONTACT_CORNER_MARGIN = 5.0
+CONTACT_SIDES = ("left", "right", "top", "bottom")
 
 # Rollout horizon
 MAX_ROLLOUT_STEPS = 0  # <=0 means full Dubins plan
 # Avoid over-dense Dubins samples when radius_turn is small; in Push-T this can
 # produce tiny target updates and negligible object motion in open loop.
-MIN_DUBINS_STEP_SIZE = 0.75
+MIN_DUBINS_STEP_SIZE = 1.2
 
 # Outputs (saved to current working directory)
 SAVE_PLOT = True
@@ -436,41 +442,136 @@ def write_rollout_debug_log(
     print(f"Saved rollout debug table to {log_path}")
 
 
-def get_config():
-    return SimpleNamespace(
-        seed=SEED,
-        reset_to_state=RESET_TO_STATE,
-        n_probe=N_PROBE,
-        probe_angle_deg=PROBE_ANGLE_DEG,
-        probe_mag=PROBE_MAG,
-        probe_discount=PROBE_DISCOUNT,
-        learner_window=LEARNER_WINDOW,
-        rho=RHO,
-        pt_local=PT_LOCAL.copy(),
-        mu=MU,
-        max_rollout_steps=MAX_ROLLOUT_STEPS,
-        min_dubins_step_size=MIN_DUBINS_STEP_SIZE,
-        render_mode=RENDER_MODE,
-        save_plot=OUTPUT_PLOT_PATH if SAVE_PLOT else "",
-        save_mp4=OUTPUT_ROLLOUT_MP4_PATH if SAVE_ROLLOUT_MP4 else "",
-        mp4_fps=OUTPUT_FPS,
-        debug_log=OUTPUT_DEBUG_LOG_PATH if SAVE_DEBUG_LOG else "",
-    )
+def linspace_with_margin(start: float, stop: float, count: int, margin: float) -> np.ndarray:
+    low = float(start + margin)
+    high = float(stop - margin)
+    if high < low:
+        center = 0.5 * (start + stop)
+        return np.array([center], dtype=float)
+    if count <= 1:
+        return np.array([0.5 * (low + high)], dtype=float)
+    return np.linspace(low, high, int(count), dtype=float)
 
 
-def main():
-    args = get_config()
-    ensure_gym_pusht_importable()
-    import gym_pusht  # noqa: F401
-    import gymnasium as gym
+def build_side_contact_points(
+    points_per_side: int, margin: float, sides: tuple[str, ...]
+) -> list[tuple[str, np.ndarray]]:
+    points: list[tuple[str, np.ndarray]] = []
+    n = max(1, int(points_per_side))
 
-    np.random.seed(args.seed)
+    if "left" in sides:
+        for i, y in enumerate(linspace_with_margin(0.0, 30.0, n, margin)):
+            points.append((f"left{i+1}", np.array([-75.0, float(y)], dtype=float)))
+    if "right" in sides:
+        for i, y in enumerate(linspace_with_margin(0.0, 30.0, n, margin)):
+            points.append((f"right{i+1}", np.array([75.0, float(y)], dtype=float)))
+    if "top" in sides:
+        for i, x in enumerate(linspace_with_margin(-15.0, 15.0, n, margin)):
+            points.append((f"top{i+1}", np.array([float(x), 135.0], dtype=float)))
+    if "bottom" in sides:
+        for i, x in enumerate(linspace_with_margin(-60.0, 60.0, n, margin)):
+            points.append((f"bottom{i+1}", np.array([float(x), -15.0], dtype=float)))
 
-    # Start-comparison plotting also needs captured rollout frames.
-    need_frame_capture = bool(args.save_mp4 or args.save_plot)
+    return points
+
+
+def evaluate_contact_candidate(args, pt_local: np.ndarray, gym):
+    """Evaluate a contact point quickly and return planning/rollout summary."""
+    env = gym.make("gym_pusht/PushT-v0", obs_type="state", render_mode="rgb_array")
+    try:
+        reset_options = None
+        if args.reset_to_state is not None:
+            reset_options = {
+                "reset_to_state": np.asarray(args.reset_to_state, dtype=float)
+            }
+        _, info = env.reset(seed=args.seed, options=reset_options)
+        T = 1.0 / env.unwrapped.control_hz
+        goal_pose = np.asarray(info["goal_pose"], dtype=float).copy()
+
+        opts_model = OptsModel()
+        opts_model.T = T
+        opts_model.rho = float(args.rho)
+        opts_model.pt = pt_local.copy()
+        opts_model.c = np.array(
+            [-pt_local[1] / opts_model.rho, pt_local[0] / opts_model.rho, -1.0],
+            dtype=float,
+        )
+        b0 = opts_model.c / np.linalg.norm(opts_model.c)
+        set_contact_model_b(opts_model, b0)
+
+        info = place_pusher_at_local_contact_without_step(env, info, pt_local, recorder=None)
+
+        learner_window = int(args.learner_window)
+        if learner_window <= 0:
+            learner_window = int(args.n_probe)
+        learner_window = max(3, min(learner_window, int(args.n_probe)))
+        learner = PushLearner(learner_window, args.probe_discount, opts_model)
+        b_est, flag_last, accepted, info = run_sysid_probing(
+            env,
+            info,
+            learner,
+            opts_model,
+            args,
+            pt_action_local=pt_local,
+            recorder=None,
+        )
+        if flag_last < 0:
+            b_est = b0
+        set_contact_model_b(opts_model, b_est)
+
+        x_start = block_pose_from_info(info)
+        info = place_pusher_at_local_contact_without_step(env, info, pt_local, recorder=None)
+        a_ls, b_ls = estimate_dubins_limit_surface_from_b(b_est, opts_model.c, opts_model.rho)
+        dubins = PushPlannerDubin(a_ls, b_ls, np.linalg.norm(pt_local), args.mu)
+
+        goal_pose_plan = goal_pose.copy()
+        goal_pose_plan[2] = unwrap_angle_near_reference(
+            float(goal_pose_plan[2]), float(x_start[2])
+        )
+        dubins_step_size = max(
+            float(dubins.radius_turn / 50.0), float(args.min_dubins_step_size)
+        )
+        x_dubins, _ = dubins.plan(x_start, goal_pose_plan, step_size=dubins_step_size)
+        p_dubins = pusher_path_from_block_traj(x_dubins, pt_local)
+
+        if args.max_rollout_steps <= 0:
+            n_exec = p_dubins.shape[1]
+        else:
+            n_exec = min(args.max_rollout_steps + 1, p_dubins.shape[1])
+
+        _, _, _, coverage_true, _, _ = execute_open_loop_pusher_targets(
+            env, info, p_dubins[:, :n_exec], goal_pose=goal_pose, recorder=None
+        )
+        return {
+            "pt_local": pt_local.copy(),
+            "plan_steps": int(x_dubins.shape[1]),
+            "exec_steps": int(max(0, n_exec - 1)),
+            "coverage_max": float(np.max(coverage_true)),
+            "coverage_final": float(coverage_true[-1]),
+            "accepted_updates": int(accepted),
+            "flag_last": int(flag_last),
+        }
+    finally:
+        env.close()
+
+
+def tagged_output_path(path_value: str, tag: str) -> str:
+    if path_value == "":
+        return ""
+    path = Path(path_value)
+    return str(path.with_name(f"{path.stem}_{tag}{path.suffix}"))
+
+
+def run_visualization_for_contact(args, gym, pt_local: np.ndarray, run_tag: str):
+    save_plot_path = tagged_output_path(args.save_plot, run_tag)
+    save_mp4_path = tagged_output_path(args.save_mp4, run_tag)
+    debug_log_path = tagged_output_path(args.debug_log, run_tag)
+
+    need_frame_capture = bool(save_mp4_path or save_plot_path)
     render_mode = "rgb_array" if need_frame_capture else args.render_mode
     if need_frame_capture and args.render_mode != "rgb_array":
         print("Overriding render mode to rgb_array for headless MP4 recording.")
+
     env = gym.make("gym_pusht/PushT-v0", obs_type="state", render_mode=render_mode)
     try:
         recorder = MP4Recorder(enabled=need_frame_capture)
@@ -484,7 +585,9 @@ def main():
 
         T = 1.0 / env.unwrapped.control_hz
         goal_pose = np.asarray(info["goal_pose"], dtype=float).copy()
+        print(f"--- Visualization run: {run_tag} ---")
         print(f"Reset seed: {args.seed}")
+        print(f"Using contact point: {pt_local}")
         print(f"Initial block pose: {block_pose_from_info(info)}")
         print(f"Goal block pose   : {goal_pose}")
         print(f"Model timestep T={T:.4f}s")
@@ -496,7 +599,6 @@ def main():
         )
 
         # Contact model setup (same local point in both frames; only world frame rotates).
-        pt_local = np.asarray(args.pt_local, dtype=float).copy()
         opts_model = OptsModel()
         opts_model.T = T
         opts_model.rho = float(args.rho)
@@ -662,7 +764,7 @@ def main():
             f"  start / min / final (px)      : {float(d_goal_true[0]):.3f} / {float(np.min(d_goal_true)):.3f} / {float(d_goal_true[-1]):.3f}"
         )
 
-        if args.save_plot:
+        if save_plot_path:
             pusht_start_frame = recorder.frames[rollout_frame_start]
             save_start_comparison_image(
                 pusht_start_frame_rgb=pusht_start_frame,
@@ -670,11 +772,11 @@ def main():
                 p_pusher_traj=p_expected_exec,
                 goal_pose=goal_pose,
                 get_tee_polygons=tee_polygons_world,
-                save_path=args.save_plot,
+                save_path=save_plot_path,
             )
-        if args.debug_log:
+        if debug_log_path:
             write_rollout_debug_log(
-                log_path=args.debug_log,
+                log_path=debug_log_path,
                 x_expected=x_expected_exec,
                 p_expected=p_expected_exec,
                 u_plan_local=u_plan_local_exec,
@@ -688,7 +790,7 @@ def main():
                 goal_pose=goal_pose,
                 T=T,
             )
-        if args.save_mp4:
+        if save_mp4_path:
             mp4_fps = (
                 float(args.mp4_fps)
                 if args.mp4_fps is not None
@@ -697,9 +799,104 @@ def main():
             rollout_frames = recorder.frames[
                 rollout_frame_start : rollout_frame_start + x_true.shape[1]
             ]
-            save_frames_to_mp4(rollout_frames, args.save_mp4, mp4_fps)
+            save_frames_to_mp4(rollout_frames, save_mp4_path, mp4_fps)
     finally:
         env.close()
+
+
+def get_config():
+    return SimpleNamespace(
+        seed=SEED,
+        reset_to_state=RESET_TO_STATE,
+        n_probe=N_PROBE,
+        probe_angle_deg=PROBE_ANGLE_DEG,
+        probe_mag=PROBE_MAG,
+        probe_discount=PROBE_DISCOUNT,
+        learner_window=LEARNER_WINDOW,
+        rho=RHO,
+        pt_local=PT_LOCAL.copy(),
+        mu=MU,
+        max_rollout_steps=MAX_ROLLOUT_STEPS,
+        min_dubins_step_size=MIN_DUBINS_STEP_SIZE,
+        render_mode=RENDER_MODE,
+        save_plot=OUTPUT_PLOT_PATH if SAVE_PLOT else "",
+        save_mp4=OUTPUT_ROLLOUT_MP4_PATH if SAVE_ROLLOUT_MP4 else "",
+        mp4_fps=OUTPUT_FPS,
+        debug_log=OUTPUT_DEBUG_LOG_PATH if SAVE_DEBUG_LOG else "",
+        search_contact_points=SEARCH_CONTACT_POINTS,
+        contact_points_per_side=CONTACT_POINTS_PER_SIDE,
+        contact_corner_margin=CONTACT_CORNER_MARGIN,
+        contact_sides=tuple(CONTACT_SIDES),
+    )
+
+
+def main():
+    args = get_config()
+    ensure_gym_pusht_importable()
+    import gym_pusht  # noqa: F401
+    import gymnasium as gym
+
+    np.random.seed(args.seed)
+
+    selected_runs: list[tuple[str, np.ndarray]] = []
+    if bool(args.search_contact_points):
+        candidate_points = build_side_contact_points(
+            args.contact_points_per_side,
+            args.contact_corner_margin,
+            args.contact_sides,
+        )
+        print(
+            "Comprehensive search over contact points along Tee sides "
+            f"(excluding corners, margin={args.contact_corner_margin:.1f})..."
+        )
+        search_results = []
+        for label, pt_candidate in candidate_points:
+            summary = evaluate_contact_candidate(args, pt_candidate, gym)
+            summary["label"] = label
+            search_results.append(summary)
+            print(
+                f"  {label:8s} pt={pt_candidate} "
+                f"plan_steps={summary['plan_steps']:4d} "
+                f"exec_steps={summary['exec_steps']:4d} "
+                f"cov_max={summary['coverage_max']:.4f} "
+                f"cov_final={summary['coverage_final']:.4f}"
+            )
+        search_results = sorted(
+            search_results,
+            key=lambda item: (
+                int(item["plan_steps"]),
+                -float(item["coverage_max"]),
+                -float(item["coverage_final"]),
+            ),
+        )
+        shortest = search_results[0]
+        highest_final = max(
+            search_results,
+            key=lambda item: (
+                float(item["coverage_final"]),
+                float(item["coverage_max"]),
+                -int(item["plan_steps"]),
+            ),
+        )
+        selected_runs.append(("shortest", np.asarray(shortest["pt_local"], dtype=float).copy()))
+        selected_runs.append(
+            ("highest_final", np.asarray(highest_final["pt_local"], dtype=float).copy())
+        )
+        print(
+            "Selected shortest-frame candidate: "
+            f"{shortest['label']} @ {shortest['pt_local']} "
+            f"(plan_steps={shortest['plan_steps']}, cov_final={shortest['coverage_final']:.4f})"
+        )
+        print(
+            "Selected highest-final-coverage candidate: "
+            f"{highest_final['label']} @ {highest_final['pt_local']} "
+            f"(cov_final={highest_final['coverage_final']:.4f}, plan_steps={highest_final['plan_steps']})"
+        )
+    else:
+        selected_runs.append(("default", np.asarray(args.pt_local, dtype=float).copy()))
+
+    for run_tag, pt_local in selected_runs:
+        run_visualization_for_contact(args, gym, pt_local, run_tag)
 
 
 if __name__ == "__main__":

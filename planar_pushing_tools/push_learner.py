@@ -60,7 +60,7 @@ class PushLearner:
             return 0, flag
 
         # Shift data buffer and insert new observation
-        print("New data accepted!")
+        # print("New data accepted!")
         self.data[:, 1:] = self.data[:, :-1]
         self.data[:, 0] = self.Y
 
